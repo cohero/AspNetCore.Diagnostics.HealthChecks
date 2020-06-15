@@ -1,30 +1,37 @@
-﻿using Microsoft.Extensions.Diagnostics.HealthChecks;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Queue;
+﻿using Azure.Storage.Queues;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using System;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace HealthChecks.AzureStorage
 {
-    public class AzureQueueStorageHealthCheck 
+    public class AzureQueueStorageHealthCheck
         : IHealthCheck
     {
-        private readonly CloudStorageAccount _storageAccount;
-        public AzureQueueStorageHealthCheck(string connectionString)
+        private readonly string _connectionString;
+        private readonly string _queueName;
+        public AzureQueueStorageHealthCheck(string connectionString, string queueName = default)
         {
-            _storageAccount = CloudStorageAccount.Parse(connectionString);
+            _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+            _queueName = queueName;
         }
         public async Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
         {
             try
             {
-                var blobClient = _storageAccount.CreateCloudQueueClient();
+                var queueServiceClient = new QueueServiceClient(_connectionString);
+                var serviceProperties = await queueServiceClient.GetPropertiesAsync(cancellationToken);
 
-                var serviceProperties = await blobClient.GetServicePropertiesAsync(
-                    new QueueRequestOptions(),
-                    operationContext: null,
-                    cancellationToken: cancellationToken);
+                if (!string.IsNullOrEmpty(_queueName))
+                {
+                    var queueClient = queueServiceClient.GetQueueClient(_queueName);
+                    if (!await queueClient.ExistsAsync(cancellationToken))
+                    {
+                        return new HealthCheckResult(context.Registration.FailureStatus, description: $"Queue '{_queueName}' not exists");
+                    }
+                    await queueClient.GetPropertiesAsync(cancellationToken);
+                }
 
                 return HealthCheckResult.Healthy();
             }

@@ -1,6 +1,6 @@
-﻿using HealthChecks.UI.Client;
-using HealthChecks.UI.Configuration;
+﻿using HealthChecks.UI.Configuration;
 using HealthChecks.UI.Core.Data;
+using HealthChecks.UI.Core.Extensions;
 using HealthChecks.UI.Core.Notifications;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
@@ -23,18 +23,25 @@ namespace HealthChecks.UI.Core.HostedService
         private readonly Settings _settings;
         private readonly HttpClient _httpClient;
         private readonly ILogger<HealthCheckReportCollector> _logger;
+        private readonly ServerAddressesService _serverAddressService;
+        private readonly IEnumerable<IHealthCheckCollectorInterceptor> _interceptors;
+        private static readonly Dictionary<int, Uri> endpointAddresses = new Dictionary<int, Uri>();
+
         public HealthCheckReportCollector(
             HealthChecksDb db,
             IHealthCheckFailureNotifier healthCheckFailureNotifier,
             IOptions<Settings> settings,
             IHttpClientFactory httpClientFactory,
-            ILogger<HealthCheckReportCollector> logger)
+            ILogger<HealthCheckReportCollector> logger,
+            ServerAddressesService serverAddressService,
+            IEnumerable<IHealthCheckCollectorInterceptor> interceptors)
         {
             _db = db ?? throw new ArgumentNullException(nameof(db));
             _healthCheckFailureNotifier = healthCheckFailureNotifier ?? throw new ArgumentNullException(nameof(healthCheckFailureNotifier));
             _settings = settings.Value ?? throw new ArgumentNullException(nameof(settings));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-
+            _serverAddressService = serverAddressService ?? throw new ArgumentNullException(nameof(serverAddressService));
+            _interceptors = interceptors ?? Enumerable.Empty<IHealthCheckCollectorInterceptor>();
             _httpClient = httpClientFactory.CreateClient(Keys.HEALTH_CHECK_HTTP_CLIENT_NAME);
         }
         public async Task Collect(CancellationToken cancellationToken)
@@ -44,12 +51,17 @@ namespace HealthChecks.UI.Core.HostedService
                 var healthChecks = await _db.Configurations
                    .ToListAsync();
 
-                foreach (var item in healthChecks)
+                foreach (var item in healthChecks.OrderBy(h => h.Id))
                 {
                     if (cancellationToken.IsCancellationRequested)
                     {
                         _logger.LogDebug("HealthReportCollector has been cancelled.");
                         break;
+                    }
+
+                    foreach (var interceptor in _interceptors)
+                    {
+                        await interceptor.OnCollectExecuting(item);
                     }
 
                     var healthReport = await GetHealthReport(item);
@@ -67,9 +79,15 @@ namespace HealthChecks.UI.Core.HostedService
                     }
 
                     await SaveExecutionHistory(item, healthReport);
+
+                    foreach (var interceptor in _interceptors)
+                    {
+                        await interceptor.OnCollectExecuted(healthReport);
+                    }
                 }
 
                 _logger.LogDebug("HealthReportCollector has completed.");
+
             }
         }
         private async Task<UIHealthReport> GetHealthReport(HealthCheckConfiguration configuration)
@@ -78,19 +96,39 @@ namespace HealthChecks.UI.Core.HostedService
 
             try
             {
-                var response = await _httpClient.GetAsync(uri);
+                var absoluteUri = GetEndpointUri(configuration);
+
+                var response = await _httpClient.GetAsync(absoluteUri);
 
                 return await response.As<UIHealthReport>();
             }
             catch (Exception exception)
             {
-                _logger.LogError(exception, "GetHealthReport threw an exception.");
+                _logger.LogError(exception, $"GetHealthReport threw an exception when trying to get report from {uri} configured with name {name}.");
 
-                return new UIHealthReport(
-                    entries: new Dictionary<string, UIHealthReportEntry>(),
-                    totalDuration: TimeSpan.FromSeconds(0));
+                return UIHealthReport.CreateFrom(exception);
             }
         }
+
+        private Uri GetEndpointUri(HealthCheckConfiguration configuration)
+        {
+            if (endpointAddresses.ContainsKey(configuration.Id))
+            {
+                return endpointAddresses[configuration.Id];
+            }
+
+            Uri.TryCreate(configuration.Uri, UriKind.Absolute, out var absoluteUri);
+
+            if (absoluteUri == null || !absoluteUri.IsValidHealthCheckEndpoint())
+            {
+                Uri.TryCreate(_serverAddressService.AbsoluteUriFromRelative(configuration.Uri), UriKind.Absolute, out absoluteUri);
+            }
+
+            endpointAddresses[configuration.Id] = absoluteUri;
+
+            return absoluteUri;
+        }
+
         private async Task<bool> HasLivenessRecoveredFromFailure(HealthCheckConfiguration configuration)
         {
             var previous = await GetHealthCheckExecution(configuration);
@@ -107,7 +145,7 @@ namespace HealthChecks.UI.Core.HostedService
             return await _db.Executions
                 .Include(le => le.History)
                 .Include(le => le.Entries)
-                .Where(le => le.Name.Equals(configuration.Name, StringComparison.InvariantCultureIgnoreCase))
+                .Where(le => le.Name == configuration.Name)
                 .SingleOrDefaultAsync();
         }
         private async Task SaveExecutionHistory(HealthCheckConfiguration configuration, UIHealthReport healthReport)
@@ -120,8 +158,11 @@ namespace HealthChecks.UI.Core.HostedService
 
             if (execution != null)
             {
-                execution.Entries.Clear();
-                execution.Entries = healthReport.ToExecutionEntries();
+
+                if (execution.Uri != configuration.Uri)
+                {
+                    UpdateUris(execution, configuration);
+                }
 
                 if (execution.Status == healthReport.Status)
                 {
@@ -131,18 +172,47 @@ namespace HealthChecks.UI.Core.HostedService
                 }
                 else
                 {
-                    _logger.LogDebug("HealthCheckReportCollector already exists but on different state, updating the values.");
-
-                    execution.History.Add(new HealthCheckExecutionHistory()
-                    {
-                        On = lastExecutionTime,
-                        Status = execution.Status
-                    });
-
-                    execution.OnStateFrom = lastExecutionTime;
-                    execution.LastExecuted = lastExecutionTime;
-                    execution.Status = healthReport.Status;
+                    SaveExecutionHistoryEntries(healthReport, execution, lastExecutionTime);
                 }
+
+                //update existing entries from new health report
+
+                foreach (var item in healthReport.ToExecutionEntries())
+                {
+                    var existing = execution.Entries
+                        .Where(e => e.Name == item.Name)
+                        .SingleOrDefault();
+
+                    if (existing != null)
+                    {
+                        existing.Status = item.Status;
+                        existing.Description = item.Description;
+                        existing.Duration = item.Duration;
+                    }
+                    else
+                    {
+                        execution.Entries.Add(item);
+                    }
+                }
+
+                //remove old entries in existing execution not present in new health report
+
+                foreach (var item in execution.Entries)
+                {
+                    var existing = healthReport.Entries
+                        .ContainsKey(item.Name);
+
+                    if (!existing)
+                    {
+                        var oldEntry = execution.Entries
+                            .Where(t => t.Name == item.Name)
+                            .SingleOrDefault();
+
+                        _db.HealthCheckExecutionEntries
+                            .Remove(oldEntry);
+                    }
+                }
+
             }
             else
             {
@@ -166,17 +236,38 @@ namespace HealthChecks.UI.Core.HostedService
             await _db.SaveChangesAsync();
         }
 
-        public void Dispose()
+        private void UpdateUris(HealthCheckExecution execution, HealthCheckConfiguration configuration)
         {
-            if (_db != null)
+            execution.Uri = configuration.Uri;
+            endpointAddresses.Remove(configuration.Id);
+        }
+
+        private void SaveExecutionHistoryEntries(UIHealthReport healthReport, HealthCheckExecution execution, DateTime lastExecutionTime)
+        {
+
+            _logger.LogDebug("HealthCheckReportCollector already exists but on different state, updating the values.");
+
+            foreach (var item in execution.Entries)
             {
-                _db.Dispose();
+                // If the health service is down, no entry in dictionary
+                if (healthReport.Entries.TryGetValue(item.Name, out var reportEntry))
+                {
+                    if (item.Status != reportEntry.Status)
+                    {
+                        execution.History.Add(new HealthCheckExecutionHistory()
+                        {
+                            On = lastExecutionTime,
+                            Status = reportEntry.Status,
+                            Name = item.Name,
+                            Description = reportEntry.Description
+                        });
+                    }
+                }
             }
 
-            if (_healthCheckFailureNotifier != null)
-            {
-                _healthCheckFailureNotifier.Dispose();
-            }
+            execution.OnStateFrom = lastExecutionTime;
+            execution.LastExecuted = lastExecutionTime;
+            execution.Status = healthReport.Status;
         }
     }
 }

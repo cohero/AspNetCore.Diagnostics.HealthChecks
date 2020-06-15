@@ -9,22 +9,34 @@ namespace HealthChecks.RabbitMQ
     public class RabbitMQHealthCheck
         : IHealthCheck
     {
-        private readonly string _rabbitMqConnectionString;
-        public RabbitMQHealthCheck(string rabbitMqConnectionString)
+        private IConnection _connection;
+        
+        private IConnectionFactory _factory;
+        private readonly Uri _rabbitConnectionString;
+        private readonly SslOption _sslOption;
+
+        public RabbitMQHealthCheck(IConnection connection)
         {
-            _rabbitMqConnectionString = rabbitMqConnectionString ?? throw new ArgumentNullException(nameof(rabbitMqConnectionString));
+            _connection = connection ?? throw new ArgumentNullException(nameof(connection));
         }
+        public RabbitMQHealthCheck(IConnectionFactory factory)
+        {
+            _factory = factory ?? throw new ArgumentNullException(nameof(factory));
+        }
+
+        public RabbitMQHealthCheck(Uri rabbitConnectionString, SslOption ssl)
+        {
+            _rabbitConnectionString = rabbitConnectionString;
+            _sslOption = ssl;
+        }
+
         public Task<HealthCheckResult> CheckHealthAsync(HealthCheckContext context, CancellationToken cancellationToken = default)
         {
             try
             {
-                var factory = new ConnectionFactory()
-                {
-                    Uri = new Uri(_rabbitMqConnectionString)
-                };
+                EnsureConnection();
 
-                using (var connection = factory.CreateConnection())
-                using (var channel = connection.CreateModel())
+                using (_connection.CreateModel())
                 {
                     return Task.FromResult(
                         HealthCheckResult.Healthy());
@@ -34,6 +46,25 @@ namespace HealthChecks.RabbitMQ
             {
                 return Task.FromResult(
                     new HealthCheckResult(context.Registration.FailureStatus, exception: ex));
+            }
+        }
+
+        private void EnsureConnection()
+        {
+            if(_connection == null )
+            {
+                if (_factory == null)
+                {
+                    _factory = new ConnectionFactory()
+                    {
+                        Uri = _rabbitConnectionString,
+                        AutomaticRecoveryEnabled = true,
+                        UseBackgroundThreadsForIO = true,
+                        Ssl = _sslOption ?? new SslOption()
+                    };
+                }
+
+                _connection = _factory.CreateConnection();
             }
         }
     }
